@@ -305,7 +305,9 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 
 		case Keepalive:
 			s.Send(conn, request)
+			break
 		default:
+			s.Send(conn, request)
 			logger.Warnf("Unkown request %v", request)
 		}
 	})
