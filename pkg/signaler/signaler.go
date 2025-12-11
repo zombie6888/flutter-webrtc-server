@@ -307,7 +307,9 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 			s.Send(conn, request)
 			break
 		default:
-			s.Send(conn, request)
+			for _, peer := range s.peers {
+				s.Send(peer.conn, request)
+			}
 			logger.Warnf("Unkown request %v", request)
 		}
 	})
