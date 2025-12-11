@@ -62,6 +62,7 @@ type Request struct {
 type PeerInfo struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
+	UserData  string `json:"user_data"`
 	UserAgent string `json:"user_agent"`
 }
 
@@ -306,6 +307,9 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 		case Keepalive:
 			s.Send(conn, request)
 		default:
+			for _, peer := range s.peers {
+				s.Send(peer.conn, request)
+			}
 			logger.Warnf("Unkown request %v", request)
 		}
 	})
