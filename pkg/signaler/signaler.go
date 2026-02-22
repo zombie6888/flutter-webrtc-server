@@ -174,6 +174,8 @@ func (s *Signaler) HandleTurnServerCredentials(writer http.ResponseWriter, reque
 		TTL:      ttl,
 		Uris: []string{
 			"turn:" + host + "?transport=udp",
+			"turn:" + host + "?transport=tcp",
+			"turns:" + host + "?transport=tcp",
 		},
 	}
 	s.expresMap.Set(turnUsername, credential, int64(ttl))
