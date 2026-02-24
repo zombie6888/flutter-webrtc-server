@@ -6,14 +6,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/logger"
-	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/turn"
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/util"
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/websocket"
 )
@@ -62,7 +61,8 @@ type Request struct {
 type PeerInfo struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
-	UserAgent string `json:"user_agent"`
+	VisitDate string `json:"visitDate"`
+	AppName   string `json:"appName"`
 }
 
 type Negotiation struct {
@@ -82,34 +82,25 @@ type Error struct {
 }
 
 type Signaler struct {
+	sync.RWMutex
 	peers     map[string]Peer
 	sessions  map[string]Session
-	turn      *turn.TurnServer
 	expresMap *util.ExpiredMap
+	turnIp    string
 }
 
-func NewSignaler(turn *turn.TurnServer) *Signaler {
+func NewSignaler(ip string) *Signaler {
 	var signaler = &Signaler{
 		peers:     make(map[string]Peer),
 		sessions:  make(map[string]Session),
-		turn:      turn,
 		expresMap: util.NewExpiredMap(),
-	}
-	signaler.turn.AuthHandler = signaler.authHandler
+		turnIp:    ip}
 	return signaler
 }
 
-func (s Signaler) authHandler(username string, realm string, srcAddr net.Addr) (string, bool) {
-	// handle turn credential.
-	if found, info := s.expresMap.Get(username); found {
-		credential := info.(TurnCredentials)
-		return credential.Password, true
-	}
-	return "", false
-}
-
 // NotifyPeersUpdate .
-func (s *Signaler) NotifyPeersUpdate(conn *websocket.WebSocketConn, peers map[string]Peer) {
+func (s *Signaler) NotifyPeersUpdate(peers map[string]Peer) {
+	s.RLock() // Блокируем на чтение перед итерацией
 	infos := []PeerInfo{}
 	for _, peer := range peers {
 		infos = append(infos, peer.info)
@@ -119,8 +110,14 @@ func (s *Signaler) NotifyPeersUpdate(conn *websocket.WebSocketConn, peers map[st
 		Type: "peers",
 		Data: infos,
 	}
+	conns := make([]*websocket.WebSocketConn, 0, len(peers))
 	for _, peer := range peers {
-		s.Send(peer.conn, request)
+		conns = append(conns, peer.conn)
+	}
+	s.RUnlock() // Снимаем блокировку
+
+	for _, c := range conns {
+		s.Send(c, request)
 	}
 }
 
@@ -167,15 +164,18 @@ func (s *Signaler) HandleTurnServerCredentials(writer http.ResponseWriter, reque
 
 	*/
 	ttl := 86400
-	host := fmt.Sprintf("%s:%d", s.turn.Config.PublicIP, s.turn.Config.Port)
+	host := s.turnIp
 	credential := TurnCredentials{
 		Username: turnUsername,
 		Password: turnPassword,
 		TTL:      ttl,
 		Uris: []string{
-			"turn:" + host + "?transport=udp",
-			"turn:" + host + "?transport=tcp",
-			"turns:" + host + "?transport=tcp",
+			// "turn:" + host + "?transport=udp",
+			// "turn:" + host + "?transport=tcp",
+			// "turns:" + host + "?transport=tcp",
+			"turn:" + host + ":3478?transport=udp",
+			"turn:" + host + ":3478?transport=tcp",
+			"turns:" + host + ":5349?transport=tcp",
 		},
 	}
 	s.expresMap.Set(turnUsername, credential, int64(ttl))
@@ -220,11 +220,23 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 				logger.Errorf("Unmarshal login error %v", err)
 				return
 			}
+			s.Lock()
+			// Если пир с таким ID уже есть, закрываем его старое соединение
+			if oldPeer, ok := s.peers[info.ID]; ok {
+				logger.Infof("Replacing old connection for peer %s", info.ID)
+				oldPeer.conn.Close()
+			}
 			s.peers[info.ID] = Peer{
 				conn: conn,
 				info: info,
 			}
-			s.NotifyPeersUpdate(conn, s.peers)
+			//peersCopy := s.peers // Делаем копию для уведомления
+			currentPeers := make(map[string]Peer)
+			for k, v := range s.peers {
+				currentPeers[k] = v
+			}
+			s.Unlock()
+			s.NotifyPeersUpdate(currentPeers)
 			break
 		case Leave:
 		case Offer:
@@ -263,7 +275,7 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 				return
 			}
 
-			ids := strings.Split(bye.SessionID, "-")
+			ids := strings.Split(bye.SessionID, ":")
 			if len(ids) != 2 {
 				msg := Request{
 					Type: "error",
@@ -306,39 +318,55 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 			sendBye(ids[1])
 
 		case Keepalive:
+			conn.RefreshDeadline(120 * time.Second)
 			s.Send(conn, request)
 			break
 		default:
+			s.RLock()
 			for _, peer := range s.peers {
 				s.Send(peer.conn, request)
 			}
+			s.RUnlock()
 			logger.Warnf("Unkown request %v", request)
 		}
 	})
 
 	conn.On("close", func(code int, text string) {
-		logger.Infof("On Close %v", conn)
-		var peerID string = ""
+		var peerID string
+		var activeConns []*websocket.WebSocketConn
 
-		for _, peer := range s.peers {
-			if peer.conn == conn {
-				peerID = peer.info.ID
-			} else {
-				leave := Request{
-					Type: "leave",
-					Data: peer.info.ID,
-				}
-				s.Send(peer.conn, leave)
+		s.Lock()
+		// 1. Находим ID уходящего
+		for id, p := range s.peers {
+			if p.conn == conn {
+				peerID = id
+				break
 			}
 		}
 
-		logger.Infof("Remove peer %s", peerID)
 		if peerID == "" {
-			logger.Infof("Leve peer id not found")
+			s.Unlock()
 			return
 		}
+
+		// 2. Удаляем его
 		delete(s.peers, peerID)
 
-		s.NotifyPeersUpdate(conn, s.peers)
+		currentPeers := make(map[string]Peer)
+		for k, v := range s.peers {
+			currentPeers[k] = v // для NotifyPeersUpdate
+			activeConns = append(activeConns, v.conn)		
+		}
+
+		s.Unlock()
+
+		leaveMsg := Request{Type: "leave", Data: peerID}
+		logger.Infof("Broadcasting leave message for %s to peers", peerID)
+		for _, c := range activeConns {
+			s.Send(c, leaveMsg)
+		}
+
+		// 3. Рассылаем обновленный список
+		s.NotifyPeersUpdate(currentPeers)
 	})
 }

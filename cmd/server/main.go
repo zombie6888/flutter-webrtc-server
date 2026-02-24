@@ -5,7 +5,6 @@ import (
 
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/logger"
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/signaler"
-	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/turn"
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/websocket"
 	"gopkg.in/ini.v1"
 )
@@ -19,19 +18,8 @@ func main() {
 	}
 
 	publicIP := cfg.Section("turn").Key("public_ip").String()
-	stunPort, err := cfg.Section("turn").Key("port").Int()
-	if err != nil {
-		stunPort = 3478
-	}
-	realm := cfg.Section("turn").Key("realm").String()
 
-	turnConfig := turn.DefaultConfig()
-	turnConfig.PublicIP = publicIP
-	turnConfig.Port = stunPort
-	turnConfig.Realm = realm
-	turn := turn.NewTurnServer(turnConfig)
-
-	signaler := signaler.NewSignaler(turn)
+	signaler := signaler.NewSignaler(publicIP)
 	wsServer := websocket.NewWebSocketServer(signaler.HandleNewWebSocket, signaler.HandleTurnServerCredentials)
 
 	sslCert := cfg.Section("general").Key("cert").String()

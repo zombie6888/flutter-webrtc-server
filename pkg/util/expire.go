@@ -31,7 +31,7 @@ func NewExpiredMap() *ExpiredMap {
 		stop:    make(chan struct{}),
 	}
 	atomic.StoreInt32(&e.needStop, 0)
-	go e.run(time.Now().Unix())
+	go e.run()
 	return &e
 }
 
@@ -40,32 +40,55 @@ type delMsg struct {
 	t    int64
 }
 
-func (e *ExpiredMap) run(now int64) {
-	t := time.NewTicker(time.Second * 1)
-	delCh := make(chan *delMsg, delChannelCap)
-	go func() {
-		for v := range delCh {
-			if atomic.LoadInt32(&e.needStop) == 1 {
-				logger.Infof("---del stop---")
-				return
-			}
-			e.multiDelete(v.keys, v.t)
-		}
-	}()
-	for {
-		select {
-		case <-t.C:
-			now++
-			if keys, found := e.timeMap[now]; found {
-				delCh <- &delMsg{keys: keys, t: now}
-			}
-		case <-e.stop:
-			logger.Infof("=== STOP ===")
-			atomic.StoreInt32(&e.needStop, 1)
-			delCh <- &delMsg{keys: []interface{}{}, t: 0}
-			return
-		}
-	}
+// func (e *ExpiredMap) run(now int64) {
+// 	t := time.NewTicker(time.Second * 1)
+// 	delCh := make(chan *delMsg, delChannelCap)
+// 	go func() {
+// 		for v := range delCh {
+// 			if atomic.LoadInt32(&e.needStop) == 1 {
+// 				logger.Infof("---del stop---")
+// 				return
+// 			}
+// 			e.multiDelete(v.keys, v.t)
+// 		}
+// 	}()
+// 	for {
+// 		select {
+// 		case <-t.C:
+// 			now++
+// 			if keys, found := e.timeMap[now]; found {
+// 				delCh <- &delMsg{keys: keys, t: now}
+// 			}
+// 		case <-e.stop:
+// 			logger.Infof("=== STOP ===")
+// 			atomic.StoreInt32(&e.needStop, 1)
+// 			delCh <- &delMsg{keys: []interface{}{}, t: 0}
+// 			return
+// 		}
+// 	}
+// }
+func (e *ExpiredMap) run() {
+    t := time.NewTicker(time.Second * 1)
+    defer t.Stop()
+    for {
+        select {
+        case <-t.C:
+            now := time.Now().Unix() // Берем реальное время
+            e.lck.Lock()
+            // Проверяем ключи в timeMap, которые меньше или равны текущему времени
+            for expTime, keys := range e.timeMap {
+                if expTime <= now {
+                    for _, k := range keys {
+                        delete(e.m, k)
+                    }
+                    delete(e.timeMap, expTime)
+                }
+            }
+            e.lck.Unlock()
+        case <-e.stop:
+            return
+        }
+    }
 }
 
 func (e *ExpiredMap) Set(key, value interface{}, expireSeconds int64) {
@@ -139,9 +162,15 @@ func (e *ExpiredMap) Clear() {
 }
 
 func (e *ExpiredMap) Close() {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	e.stop <- struct{}{}
+	e.lck.Lock() 
+    defer e.lck.Unlock()
+
+    select {
+    case <-e.stop:      
+        return 
+    default:       
+        close(e.stop) 
+    }
 }
 
 func (e *ExpiredMap) Stop() {

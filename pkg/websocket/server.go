@@ -3,6 +3,7 @@ package websocket
 import (
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/logger"
 	"github.com/gorilla/websocket"
@@ -43,6 +44,8 @@ func NewWebSocketServer(
 		handleTurnServer: turnServerHandler,
 	}
 	server.upgrader = websocket.Upgrader{
+		ReadBufferSize:  32768, // 32KB
+        WriteBufferSize: 32768, // 32KB
 		CheckOrigin: func(r *http.Request) bool {
 			return true
 		},
@@ -55,8 +58,10 @@ func (server *WebSocketServer) handleWebSocketRequest(writer http.ResponseWriter
 	//responseHeader.Add("Sec-WebSocket-Protocol", "protoo")
 	socket, err := server.upgrader.Upgrade(writer, request, responseHeader)
 	if err != nil {
-		logger.Panicf("%v", err)
+		logger.Errorf("Websocket upgrade failed: %v", err)
 	}
+	socket.SetReadLimit(1024 * 1024)
+
 	wsTransport := NewWebSocketConn(socket)
 	server.handleWebSocket(wsTransport, request)
 	wsTransport.ReadMessage()
@@ -71,8 +76,14 @@ func (server *WebSocketServer) Bind(cfg WebSocketServerConfig) {
 	// Websocket handle func
 	http.HandleFunc(cfg.WebSocketPath, server.handleWebSocketRequest)
 	http.HandleFunc(cfg.TurnServerPath, server.handleTurnServerRequest)
-	http.Handle("/", http.FileServer(http.Dir(cfg.HTMLRoot)))
-	logger.Infof("Flutter WebRTC Server listening on: %s:%d", cfg.Host, cfg.Port)
-	// http.ListenAndServe(cfg.Host+":"+strconv.Itoa(cfg.Port), nil)
-	panic(http.ListenAndServeTLS(cfg.Host+":"+strconv.Itoa(cfg.Port), cfg.CertFile, cfg.KeyFile, nil))
+	// http.Handle("/", http.FileServer(http.Dir(cfg.HTMLRoot)))
+	addr := cfg.Host + ":" + strconv.Itoa(cfg.Port)
+    s := &http.Server{
+        Addr:         addr,
+        ReadTimeout:  15 * time.Second,
+        WriteTimeout: 15 * time.Second,
+        IdleTimeout:  60 * time.Second,
+    }
+	logger.Infof("Flutter WebRTC Server listening on: %s", addr)
+	panic(s.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile))
 }
