@@ -44,13 +44,14 @@ type Session struct {
 type Method string
 
 const (
-	New       Method = "new"
-	Bye       Method = "bye"
-	Offer     Method = "offer"
-	Answer    Method = "answer"
-	Candidate Method = "candidate"
-	Leave     Method = "leave"
-	Keepalive Method = "keepalive"
+	New         Method = "new"
+	Bye         Method = "bye"
+	Offer       Method = "offer"
+	Answer      Method = "answer"
+	Candidate   Method = "candidate"
+	Leave       Method = "leave"
+	Keepalive   Method = "keepalive"
+	ChatMessage Method = "chat_message"
 )
 
 type Request struct {
@@ -79,6 +80,11 @@ type Byebye struct {
 type Error struct {
 	Request string `json:"request"`
 	Reason  string `json:"reason"`
+}
+
+type ChatMessageData struct {
+	Type  string   `json:"type"`
+	Peers []string `json:"peers"`
 }
 
 type Signaler struct {
@@ -321,6 +327,74 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 			conn.RefreshDeadline(120 * time.Second)
 			s.Send(conn, request)
 			break
+		case ChatMessage:
+			{
+				var chatData ChatMessageData
+				err := json.Unmarshal(body, &chatData)
+				if err != nil {
+					logger.Errorf("Unmarshal chat_message got error %v", err)
+					return
+				}
+
+				if chatData.Type != "notification" && chatData.Type != "message" {
+					msg := Request{
+						Type: "error",
+						Data: Error{
+							Request: string(request.Type),
+							Reason:  "Invalid chat_message type. Expected notification or message.",
+						},
+					}
+					s.Send(conn, msg)
+					return
+				}
+
+				if len(chatData.Peers) == 0 {
+					msg := Request{
+						Type: "error",
+						Data: Error{
+							Request: string(request.Type),
+							Reason:  "Peers list is empty.",
+						},
+					}
+					s.Send(conn, msg)
+					return
+				}
+
+				seen := make(map[string]struct{}, len(chatData.Peers))
+				targetConns := make([]*websocket.WebSocketConn, 0, len(chatData.Peers))
+
+				s.RLock()
+				for _, peerID := range chatData.Peers {
+					if _, ok := seen[peerID]; ok {
+						continue
+					}
+					seen[peerID] = struct{}{}
+
+					peer, ok := s.peers[peerID]
+					if !ok {
+						continue
+					}
+					targetConns = append(targetConns, peer.conn)
+				}
+				s.RUnlock()
+
+				if len(targetConns) == 0 {
+					msg := Request{
+						Type: "error",
+						Data: Error{
+							Request: string(request.Type),
+							Reason:  "No target peers found.",
+						},
+					}
+					s.Send(conn, msg)
+					return
+				}
+
+				for _, targetConn := range targetConns {
+					s.Send(targetConn, request)
+				}
+			}
+			break
 		default:
 			s.RLock()
 			for _, peer := range s.peers {
@@ -355,7 +429,7 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 		currentPeers := make(map[string]Peer)
 		for k, v := range s.peers {
 			currentPeers[k] = v // для NotifyPeersUpdate
-			activeConns = append(activeConns, v.conn)		
+			activeConns = append(activeConns, v.conn)
 		}
 
 		s.Unlock()
