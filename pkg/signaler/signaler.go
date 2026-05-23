@@ -143,7 +143,8 @@ func (s *Signaler) HandleTurnServerCredentials(writer http.ResponseWriter, reque
 		return
 	}
 	username := params["username"][0]
-	timestamp := time.Now().Unix()
+	ttl := 86400
+	timestamp := time.Now().Unix() + int64(ttl)
 	turnUsername := fmt.Sprintf("%d:%s", timestamp, username)
 	hmac := hmac.New(sha1.New, []byte(sharedKey))
 	hmac.Write([]byte(turnUsername))
@@ -169,7 +170,6 @@ func (s *Signaler) HandleTurnServerCredentials(writer http.ResponseWriter, reque
 		var pc = new RTCPeerConnection(config);
 
 	*/
-	ttl := 86400
 	host := s.turnIp
 	credential := TurnCredentials{
 		Username: turnUsername,
@@ -198,9 +198,8 @@ func (s *Signaler) Send(conn *websocket.WebSocketConn, m interface{}) error {
 }
 
 func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *http.Request) {
-	logger.Infof("On Open %v", request)
+	logger.Infof("On Open remote=%s userAgent=%q path=%s", request.RemoteAddr, request.UserAgent(), request.URL.Path)
 	conn.On("message", func(message []byte) {
-		logger.Infof("On message %v", string(message))
 		var body json.RawMessage
 		request := Request{
 			Data: &body,
@@ -257,9 +256,13 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 					logger.Errorf("Unmarshal "+string(request.Type)+" got error %v", err)
 					return
 				}
+				if request.Type != Candidate {
+					logger.Infof("Forward negotiation type=%s from=%s to=%s session=%s", request.Type, negotiation.From, negotiation.To, negotiation.SessionID)
+				}
 				to := negotiation.To
 				peer, ok := s.peers[to]
 				if !ok {
+					logger.Warnf("Negotiation target not found type=%s from=%s to=%s session=%s", request.Type, negotiation.From, negotiation.To, negotiation.SessionID)
 					msg := Request{
 						Type: "error",
 						Data: Error{
@@ -280,6 +283,7 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 				logger.Errorf("Unmarshal bye got error %v", err)
 				return
 			}
+			logger.Infof("Bye received from=%s session=%s", bye.From, bye.SessionID)
 
 			ids := strings.Split(bye.SessionID, ":")
 			if len(ids) != 2 {
@@ -298,6 +302,7 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 				peer, ok := s.peers[id]
 
 				if !ok {
+					logger.Warnf("Bye target not found id=%s session=%s", id, bye.SessionID)
 					msg := Request{
 						Type: "error",
 						Data: Error{
@@ -308,14 +313,15 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 					s.Send(conn, msg)
 					return
 				}
-				bye := Request{
+				byeRequest := Request{
 					Type: "bye",
 					Data: map[string]interface{}{
 						"to":         id,
 						"session_id": bye.SessionID,
 					},
 				}
-				s.Send(peer.conn, bye)
+				logger.Infof("Send bye to=%s session=%s", id, bye.SessionID)
+				s.Send(peer.conn, byeRequest)
 			}
 
 			// send to aleg
@@ -406,6 +412,7 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 	})
 
 	conn.On("close", func(code int, text string) {
+		logger.Warnf("WebSocket close event code=%d text=%q", code, text)
 		var peerID string
 		var activeConns []*websocket.WebSocketConn
 
@@ -420,6 +427,7 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 
 		if peerID == "" {
 			s.Unlock()
+			logger.Warnf("Close event without registered peer code=%d text=%q", code, text)
 			return
 		}
 
@@ -435,7 +443,7 @@ func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *ht
 		s.Unlock()
 
 		leaveMsg := Request{Type: "leave", Data: peerID}
-		logger.Infof("Broadcasting leave message for %s to peers", peerID)
+		logger.Warnf("Broadcasting leave message peer=%s activePeers=%d closeCode=%d closeText=%q", peerID, len(activeConns), code, text)
 		for _, c := range activeConns {
 			s.Send(c, leaveMsg)
 		}
